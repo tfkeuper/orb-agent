@@ -24,6 +24,7 @@ from device_discovery.policy.models import (
 from device_discovery.translate import (
     _build_vlan_cache,
     _ensure_vlan,
+    _interfaces_vlan_ids,
     _strip_prefix,
     _target_ipv4_candidate,
     apply_interface_vlans,
@@ -190,6 +191,25 @@ def test_translate_device_with_rack(sample_device_info, sample_defaults):
     assert device.rack.location.site.name == "New York"
 
 
+def test_translate_device_with_position_and_face(sample_device_info, sample_defaults):
+    """A target's position and face place the device in its rack."""
+    sample_defaults.rack = "Rack-01"
+    sample_defaults.position = 40.5
+    sample_defaults.face = "rear"
+    device = translate_device(sample_device_info, sample_defaults)
+    assert device.rack.name == "Rack-01"
+    assert device.position == 40.5
+    assert device.face == "rear"
+
+
+def test_translate_device_without_position_sends_none(sample_device_info, sample_defaults):
+    """With a rack alone, the device is left unplaced: no position or face is sent."""
+    sample_defaults.rack = "Rack-01"
+    device = translate_device(sample_device_info, sample_defaults)
+    assert not device.HasField("position")
+    assert not device.HasField("face")
+
+
 def test_translate_device_rack_without_location(sample_device_info, sample_defaults):
     """Rack carries no location when no location default is set (site+name only)."""
     sample_defaults.rack = "Rack-01"
@@ -257,6 +277,66 @@ def test_translate_interface_ips_with_vrf_string(
     assert len(ip_entities) == 2
     assert ip_entities[0].prefix.vrf.name == "plain-prefix-vrf"
     assert ip_entities[1].ip_address.vrf.name == "plain-vrf"
+
+
+def test_translate_interface_ips_vrf_carries_its_own_tenant(
+    sample_device_info,
+    sample_interface_info,
+    sample_interfaces_ip,
+    sample_defaults,
+):
+    """The VRF tenant reaches the VRF; the address and prefix keep their own tenant."""
+    owner = TenantParameters(name="acme", group="customers")
+    sample_defaults.ipaddress = IpamParameters(
+        tenant="ip-tenant", vrf=VrfParameters(name="example-vrf", tenant=owner)
+    )
+    sample_defaults.prefix = PrefixParameters(
+        tenant="prefix-tenant", vrf=VrfParameters(name="example-vrf", tenant=owner)
+    )
+    device = translate_device(sample_device_info, sample_defaults)
+    interface = translate_interface(
+        device,
+        "GigabitEthernet0/0/1",
+        sample_interface_info["GigabitEthernet0/0/1"],
+        sample_defaults,
+    )
+    prefix, ip = (
+        e for e in translate_interface_ips(interface, sample_interfaces_ip, sample_defaults)
+    )
+
+    assert prefix.prefix.vrf.tenant.name == "acme"
+    assert prefix.prefix.vrf.tenant.group.name == "customers"
+    assert prefix.prefix.tenant.name == "prefix-tenant"
+    assert ip.ip_address.vrf.tenant.name == "acme"
+    assert ip.ip_address.vrf.tenant.group.name == "customers"
+    assert ip.ip_address.tenant.name == "ip-tenant"
+
+
+def test_translate_interface_ips_vrf_does_not_inherit_tenant(
+    sample_device_info,
+    sample_interface_info,
+    sample_interfaces_ip,
+    sample_defaults,
+):
+    """A VRF without its own tenant stays tenant-less, so existing policies match as before."""
+    sample_defaults.ipaddress = IpamParameters(tenant="ip-tenant", vrf="plain-vrf")
+    sample_defaults.prefix = PrefixParameters(
+        tenant="prefix-tenant", vrf=VrfParameters(name="plain-prefix-vrf")
+    )
+    device = translate_device(sample_device_info, sample_defaults)
+    interface = translate_interface(
+        device,
+        "GigabitEthernet0/0/1",
+        sample_interface_info["GigabitEthernet0/0/1"],
+        sample_defaults,
+    )
+    prefix, ip = (
+        e for e in translate_interface_ips(interface, sample_interfaces_ip, sample_defaults)
+    )
+
+    assert not prefix.prefix.vrf.HasField("tenant")
+    assert not ip.ip_address.vrf.HasField("tenant")
+    assert ip.ip_address.tenant.name == "ip-tenant"
 
 
 # --- per-address-family VRF (orb-agent#392) ---------------------------------
@@ -2407,6 +2487,65 @@ def test_translate_data_withholds_prefix_vlan_when_the_option_is_off(sample_devi
             assert not e.prefix.HasField("vlan")
 
 
+def test_translate_data_emits_prefix_vlan_from_device_reported_vlan_ids(sample_device_info):
+    """
+    The whole path for a routed VLAN sub-interface on a MikroTik-shaped device.
+
+    The VLAN database names the VLAN after the interface, and only the driver's
+    interface-to-VLAN-ID map can tie ``sfpplus1.156`` to VLAN 156: the name
+    alone is never parsed for it. The S-tag interface is reported as ``None``
+    and must not be linked.
+    """
+    data = {
+        "device": sample_device_info,
+        "interface": {
+            "sfpplus1.156": {"is_up": True, "is_enabled": True, "type": "virtual"},
+            "vlan300": {"is_up": True, "is_enabled": True, "type": "virtual"},
+        },
+        "interface_ip": {
+            "sfpplus1.156": {"ipv4": {"192.0.2.1": {"prefix_length": 30}}},
+            "vlan300": {"ipv4": {"198.51.100.1": {"prefix_length": 24}}},
+        },
+        "vlan": {
+            "156": {"name": "sfpplus1.156", "interfaces": ["sfpplus1"]},
+            "300": {"name": "vlan300", "interfaces": ["ether1"]},
+        },
+        "interfaces_vlan_id": {"sfpplus1.156": 156, "vlan300": None},
+        "driver": "mikrotik_routeros",
+        "defaults": Defaults(site="dc1"),
+        "options": Options(emit_prefix_vlan="svi-name"),
+    }
+
+    prefixes = {
+        e.prefix.prefix: e.prefix
+        for e in translate_data(data)
+        if e.WhichOneof("entity") == "prefix"
+    }
+    assert prefixes["192.0.2.0/30"].vlan.vid == 156
+    assert prefixes["192.0.2.0/30"].vlan.name == "sfpplus1.156"
+    assert not prefixes["198.51.100.0/24"].HasField("vlan"), (
+        "a VLAN ID the device withholds must not be recovered from the name"
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, {}),
+        ({}, {}),
+        (["sfpplus1.156", 156], {}),            # not a mapping at all
+        ({"sfpplus1.156": 156}, {"sfpplus1.156": 156}),
+        ({"svc100": None}, {"svc100": None}),   # reported, withheld
+        ({"a": 0, "b": 4095, "c": 1, "d": 4094}, {"c": 1, "d": 4094}),
+        ({"a": True, "b": "10", "c": 10.0}, {}),
+        ({"": 10, 5: 10}, {}),
+    ],
+)
+def test_interfaces_vlan_ids_validates_the_driver_payload(raw, expected):
+    """Only a name mapped to None or a VID in 1..4094 survives validation."""
+    assert _interfaces_vlan_ids(raw) == expected
+
+
 def test_junos_switching_unit_lands_on_the_physical_port():
     """
     Junos reports switching on unit .0; NetBox wants it on the port.
@@ -2471,3 +2610,80 @@ def test_junos_switching_unit_lands_on_the_physical_port():
     assert port.untagged_vlan.vid == 888
     assert unit.mode == "", "the subinterface must not carry the switchport config"
     assert not unit.HasField("untagged_vlan")
+
+
+def test_emit_prefixes_and_ip_addresses_default_on():
+    """Unset, both keep sending what device-discovery has always sent."""
+    assert Options().emit_prefixes is True
+    assert Options().emit_ip_addresses is True
+
+
+@pytest.mark.parametrize(
+    ("options", "want_prefixes", "want_addresses"),
+    [
+        (None, ["192.0.2.0/24", "2001:db8::/64"], ["192.0.2.1/24", "2001:db8::1/64"]),
+        (Options(), ["192.0.2.0/24", "2001:db8::/64"], ["192.0.2.1/24", "2001:db8::1/64"]),
+        (Options(emit_prefixes=False), [], ["192.0.2.1/24", "2001:db8::1/64"]),
+        (Options(emit_ip_addresses=False), ["192.0.2.0/24", "2001:db8::/64"], []),
+        (Options(emit_prefixes=False, emit_ip_addresses=False), [], []),
+    ],
+    ids=["no options", "defaults", "no prefixes", "no addresses", "neither"],
+)
+def test_emit_prefixes_and_ip_addresses_drop_only_their_own_entities(
+    sample_device_info, sample_interface_info, sample_defaults,
+    options, want_prefixes, want_addresses,
+):
+    """Each option drops its own entity kind and leaves the other as it was."""
+    interfaces_ip = {
+        "GigabitEthernet0/0/1": {
+            "ipv4": {"192.0.2.1": {"prefix_length": 24}},
+            "ipv6": {"2001:db8::1": {"prefix_length": 64}},
+        }
+    }
+    prefixes, addresses = _emit_ips_for(
+        sample_device_info, sample_interface_info, sample_defaults, interfaces_ip,
+        options=options,
+    )
+    assert sorted(prefixes) == want_prefixes
+    assert sorted(addresses) == want_addresses
+
+
+def test_emit_prefixes_and_ip_addresses_off_end_to_end(
+    sample_device_info, sample_interface_info, sample_interfaces_ip
+):
+    """
+    Both off: no IPAddress, no Prefix and no primary IP, but every interface.
+
+    That includes an interface only the IP data names.
+    """
+    interfaces_ip = dict(sample_interfaces_ip)
+    interfaces_ip["Loopback0"] = {"ipv4": {"198.51.100.1": {"prefix_length": 32}}}
+    data = {
+        "device": sample_device_info,
+        "interface": sample_interface_info,
+        "interface_ip": interfaces_ip,
+        "driver": "ios",
+        "target_hostname": "192.0.2.1",
+        "options": Options(emit_ip_addresses=False, emit_prefixes=False),
+    }
+    entities = list(translate_data(data))
+    kinds = {e.WhichOneof("entity") for e in entities}
+    assert "ip_address" not in kinds
+    assert "prefix" not in kinds
+    device = next(e.device for e in entities if e.WhichOneof("entity") == "device")
+    assert not device.HasField("primary_ip4")
+    names = {e.interface.name for e in entities if e.WhichOneof("entity") == "interface"}
+    assert {"GigabitEthernet0/0/1", "Loopback0"} <= names
+
+
+def test_emit_prefixes_and_ip_addresses_off_skip_unreadable_addresses(
+    sample_device_info, sample_interface_info, sample_defaults
+):
+    """With both off the addresses are not read, so one that will not parse costs nothing."""
+    interfaces_ip = {"GigabitEthernet0/0/1": {"ipv4": {"not-an-address": {"prefix_length": 24}}}}
+    prefixes, addresses = _emit_ips_for(
+        sample_device_info, sample_interface_info, sample_defaults, interfaces_ip,
+        options=Options(emit_prefixes=False, emit_ip_addresses=False),
+    )
+    assert prefixes == []
+    assert addresses == []

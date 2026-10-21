@@ -19,12 +19,13 @@ NetBox accepts, one with an empty label, longer than 255 characters or left
 with no letter or digit, is left off; the address is still sent, and a
 `dns_name` NetBox already holds for it stays as it is. In either case the
 name as nmap gave it is kept under `hostnames` in the IP's comments, unless
-the policy sets `defaults.comments`, which the backend does not add to. A
-name that needed no change is not recorded, so this changes nothing in the
-comments of an IP whose name was already acceptable. Each run logs how many
-names it replaced or left off. A name that was already accepted with an
-asterisk, which NetBox allows as a leading wildcard label, changes on the
-next run, since nmap's asterisk never marks a wildcard.
+the policy sets `defaults.comments`, which the backend does not add to, or
+turns off `options.emit_scan_metadata`. A name that needed no change is not
+recorded, so this changes nothing in the comments of an IP whose name was
+already acceptable. Each run logs how many names it replaced or left off. A
+name that was already accepted with an asterisk, which NetBox allows as a
+leading wildcard label, changes on the next run, since nmap's asterisk never
+marks a wildcard.
 
 ## Configuration
 The `network_discovery` backend does not require any special configuration, though overriding `host` and `port` values can be specified. The backend will use the `diode` settings specified in the `common` subsection to forward discovery results.
@@ -57,21 +58,103 @@ Config defines data for the whole scope and is optional overall.
 |:---------:|:----:|:--------:|:-----------:|
 | schedule | cron format | no  |  If defined, it will execute scope following cron schedule time. If not defined, it will execute scope only once  |
 | defaults | map | no  |  key value pair that defines default values  |
+| options | map | no | Per-policy toggles, see [Options](#options). |
 | timeout | int | no | Timeout in minutes for the nmap scan operation. The default value is 5 minutes.
+
+#### Options
+
+| Key | Type | Description |
+|:---:|:----:|:-----------:|
+| emit_scan_metadata | bool | Write the scan result into each discovered IP's comments: every port nmap lists with its state, a count of the ports it summarised, and the reverse hostname when it had to change to fit `dns_name` or was left off. Defaults to `true`. Set `false` to send no comments, so the comments in NetBox stay as they are, including ones an earlier run wrote. When `defaults.comments` is set, that text is sent instead of the scan result, whatever this option says. With it off, a reverse hostname that had to change or was left off is not recorded anywhere; each run still logs how many there were. |
+
+```yaml
+policies:
+  network_1:
+    config:
+      options:
+        emit_scan_metadata: false
+    scope:
+      targets: [192.0.2.0/24]
+```
 
 #### Defaults
 Current supported defaults:
 
 |  Key  | Type | Description  |
 |:-----:|:----:|:-------------:|
-| vrf | str | VRF name to assign to discovered IP addresses |
-| rd | str | Route Distinguisher (RD) for the VRF (only used when `vrf` is set). Optional — when omitted the VRF is emitted without an RD so NetBox can match an existing VRF whose `rd` is null. |
-| tenant | str | Tenant name to assign to discovered IP addresses |
+| vrf | string \| map | VRF to assign to discovered IP addresses. Accepts a bare VRF name or a map with `name` + optional `rd` / `tenant` / `description` / `comments` / `tags` (see [VRF map](#vrf-map) below). Use the map form with `tenant` when the VRF belongs to a tenant in NetBox, so Diode matches it instead of creating a second VRF. |
+| rd | str | Route Distinguisher (RD) for the VRF (only used when `vrf` is set). Optional; when omitted the VRF is emitted without an RD so NetBox can match an existing VRF whose `rd` is null. Equivalent to `vrf.rd`; a policy that sets both to different values is refused. |
+| tenant | string \| map | Tenant to assign to discovered IP addresses. Accepts a bare tenant name or a map with `name` + optional `group` / `description` / `comments` / `tags` (see [Tenant map](#tenant-map) below). Use the map form when the tenant already exists in a tenant group so Diode matches it instead of planning a create. |
 | role | str | Role to assign to discovered IP addresses |
-| comments | str | NetBox Comments information to be added to discovered IP |
+| comments | str | Comments for discovered IPs, sent on every run in place of the scan metadata (see [Options](#options)) |
 | description | str | NetBox Description data to be added to discovered IP |
 | tags | list | NetBox Tags to be added to discovered IP |
 | network_mask | int | Default network mask to be applied to IPv4 (default: 32) |
+
+##### Tenant map
+The `defaults.tenant` field accepts either a bare string (tenant name) or a map:
+
+| Parameter | Type | Description |
+|---------|----|-----------|
+| name | string | Tenant name (required when using the map form) |
+| group | string | Tenant group name |
+| description | string | Tenant description |
+| comments | string | Tenant comments |
+| tags | list | Tenant tags |
+
+Example — match an existing grouped tenant:
+
+```yaml
+defaults:
+  tenant:
+    name: "Example Tenant GmbH"
+    group: "Example Group"
+```
+
+##### VRF map
+The `defaults.vrf` field accepts either a bare string (VRF name) or a map:
+
+| Parameter | Type | Description |
+|---------|----|-----------|
+| name | string | VRF name (required when using the map form) |
+| rd | string | Route Distinguisher, equivalent to `defaults.rd` |
+| tenant | string \| map | Tenant the VRF belongs to, in the same form as `defaults.tenant` (see [Tenant map](#tenant-map)) |
+| description | string | VRF description, written to the VRF on every run |
+| comments | string | VRF comments, written to the VRF on every run |
+| tags | list | VRF tags, added to the VRF's existing tags |
+
+Any other key in the map, or in its tenant map, is refused, so a misspelt key such as `tenant` or `group` is not silently dropped.
+
+`defaults.tenant` applies to the discovered IP addresses only and does not set the VRF's tenant. Diode matches a VRF without an RD by its name and tenant, so when the VRF belongs to a tenant in NetBox, name that tenant under `vrf`. Otherwise Diode creates a second VRF with the same name and no tenant.
+
+When the VRF has an RD in NetBox, set `rd` too. Diode then finds the VRF by its RD alone and writes the policy's VRF name, and tenant when set, onto it, so both must match what NetBox holds.
+
+When `defaults.tenant` and `vrf.tenant` name the same tenant, write them identically, for example with the anchor below. Diode trims names and, when a tenant's name and group match no tenant, falls back to its slug whatever its group, so names with the same slug, for example ones that differ only in case or accents, or by a space against a hyphen, are one tenant to it. If the two copies of that tenant disagree on its name, group, `description`, `comments`, `tags` or the order of its tags, Diode refuses every address, rewrites the tenant on every run or creates a second tenant of that name, depending on what NetBox already holds, so such a policy is refused, as is one that writes a tenant group two ways.
+
+If an earlier run already created the extra tenant-less VRF, discovered addresses are created again in the tenant's VRF once the policy names its tenant. Reassign or delete the addresses left in the extra VRF, then delete that VRF.
+
+Example: match an existing VRF that belongs to a grouped tenant:
+
+```yaml
+defaults:
+  vrf:
+    name: "Example VRF"
+    tenant:
+      name: "Example Tenant GmbH"
+      group: "Example Group"
+```
+
+When the IP addresses and the VRF share a tenant, a YAML anchor avoids repeating it:
+
+```yaml
+defaults:
+  tenant: &owner
+    name: "Example Tenant GmbH"
+    group: "Example Group"
+  vrf:
+    name: "Example VRF"
+    tenant: *owner
+```
 
 ### Scope
 The scope defines a list of targets to be scanned.
@@ -106,9 +189,14 @@ orb:
         config:
           schedule: "* * * * *"
           timeout: 5
+          options:
+            emit_scan_metadata: true
           defaults:
             description: IP discovered by network discovery
             tags: [net-discovery, orb-agent]
+            # tenant: customer-a
+            # tenant: { name: customer-a, group: customers }
+            # vrf: { name: example-vrf, tenant: customer-a }
         scope:
           targets: 
             - 192.168.7.32

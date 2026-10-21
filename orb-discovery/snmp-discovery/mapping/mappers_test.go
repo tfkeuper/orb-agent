@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/netboxlabs/orb-agent/orb-discovery/snmp-discovery/config"
 	"github.com/netboxlabs/orb-agent/orb-discovery/snmp-discovery/mapping"
@@ -287,7 +287,7 @@ func TestIPAddressMapper_Map(t *testing.T) {
 			defaults: &config.Defaults{
 				IPAddress: config.IPAddressDefaults{
 					Description: "IP Address specific description",
-					Tenant:      "ip-address-tenant",
+					Tenant:      config.TenantParameters{Name: "ip-address-tenant"},
 					Role:        "ip-address-role",
 					Vrf:         config.VrfParameters{Name: "ip-address-vrf"},
 				},
@@ -1516,6 +1516,61 @@ func TestInterfaceMapper_Map(t *testing.T) {
 			expectError: false,
 		},
 		{
+			// Cutting at byte 197 would split the é and fail the whole ingest.
+			name: "long interface description is cut by character, not byte",
+			values: map[mapping.ObjectIDIndex]*mapping.ObjectIDValue{
+				"1.3.6.1.2.1.2.2.1.1.1": {
+					OID:    "1.3.6.1.2.1.2.2.1.1.1",
+					Index:  "1",
+					Parent: "1.3.6.1.2.1.2.2.1.1",
+					Value:  "1",
+					Type:   mapping.Integer,
+				},
+				"1.3.6.1.2.1.2.2.1.2.1": {
+					OID:    "1.3.6.1.2.1.2.2.1.2.1",
+					Index:  "1",
+					Parent: "1.3.6.1.2.1.2.2.1.2",
+					Value:  "eth0",
+					Type:   mapping.OctetString,
+				},
+				"1.3.6.1.2.1.31.1.1.1.18.1": {
+					OID:    "1.3.6.1.2.1.31.1.1.1.18.1",
+					Index:  "1",
+					Parent: "1.3.6.1.2.1.31.1.1.1.18",
+					Value:  strings.Repeat("a", 196) + "é suite",
+					Type:   mapping.OctetString,
+				},
+			},
+			mappingEntry: &mapping.Entry{
+				OID:    "1.3.6.1.2.1.2.2.1.1",
+				Entity: "interface",
+				Field:  "_id",
+				MappingEntries: []mapping.Entry{
+					{
+						OID:    "1.3.6.1.2.1.2.2.1.1",
+						Entity: "interface",
+						Field:  "_id",
+					},
+					{
+						OID:    "1.3.6.1.2.1.2.2.1.2",
+						Entity: "interface",
+						Field:  "name",
+					},
+					{
+						OID:    "1.3.6.1.2.1.31.1.1.1.18",
+						Entity: "interface",
+						Field:  "description",
+					},
+				},
+			},
+			defaults: nil,
+			expectedEntity: &diode.Interface{
+				Name:        mapping.StringPtr("eth0"),
+				Description: mapping.StringPtr(strings.Repeat("a", 196) + "é..."),
+			},
+			expectError: false,
+		},
+		{
 			name: "interior null bytes are stripped from interface name and description",
 			values: map[mapping.ObjectIDIndex]*mapping.ObjectIDValue{
 				"1.3.6.1.2.1.2.2.1.1.1": {
@@ -2717,6 +2772,48 @@ func TestDeviceMapper_Map(t *testing.T) {
 			expectedEntity: &diode.Device{
 				Name:        mapping.StringPtr("test-device"),
 				Description: mapping.StringPtr("This device description is deliberately longer than two hundred characters to test the truncation functionality that should cut it off at 197 characters and add an ellipsis suffix to indicate that ..."),
+			},
+			expectError: false,
+		},
+		{
+			name: "long device description is cut by character, not byte",
+			values: map[mapping.ObjectIDIndex]*mapping.ObjectIDValue{
+				"1.3.6.1.2.1.1.5.0": {
+					OID:    "1.3.6.1.2.1.1.5.0",
+					Index:  "0",
+					Parent: "1.3.6.1.2.1.1.5",
+					Value:  "test-device",
+					Type:   mapping.OctetString,
+				},
+				"1.3.6.1.2.1.1.1.0": {
+					OID:    "1.3.6.1.2.1.1.1.0",
+					Index:  "0",
+					Parent: "1.3.6.1.2.1.1.1",
+					Value:  strings.Repeat("a", 196) + "é suite",
+					Type:   mapping.OctetString,
+				},
+			},
+			mappingEntry: &mapping.Entry{
+				OID:    "1.3.6.1.2.1.1",
+				Entity: "device",
+				Field:  "_id",
+				MappingEntries: []mapping.Entry{
+					{
+						OID:    "1.3.6.1.2.1.1.5",
+						Entity: "device",
+						Field:  "name",
+					},
+					{
+						OID:    "1.3.6.1.2.1.1.1",
+						Entity: "device",
+						Field:  "description",
+					},
+				},
+			},
+			defaults: nil,
+			expectedEntity: &diode.Device{
+				Name:        mapping.StringPtr("test-device"),
+				Description: mapping.StringPtr(strings.Repeat("a", 196) + "é..."),
 			},
 			expectError: false,
 		},

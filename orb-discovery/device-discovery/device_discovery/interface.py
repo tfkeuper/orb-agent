@@ -411,7 +411,8 @@ def _undesirable_prefix_reason(
     keep the existing behavior.
 
     Suppression applies only to the derived Prefix. The IPAddress entity is
-    always still emitted, so the interface and its address stay documented.
+    still emitted, unless emit_ip_addresses is False, so the interface and its
+    address stay documented.
     """
     # Link-local is judged on the ADDRESS, not the derived network. A mask
     # shorter than /10 widens the network out of fe80::/10 — fe80::1/9
@@ -438,23 +439,109 @@ def _undesirable_prefix_reason(
 def _resolve_prefix_vlan_candidate(
     interface_name: str,
     vlan_cache: dict[int, pb.VLAN] | None,
+    iface_vlan_ids: dict[str, int | None] | None = None,
 ) -> pb.VLAN | None:
     """
     Return the VLAN this interface proposes for a derived prefix, or None.
 
-    Only an SVI-style name (per ``svi_vlan_id``) resolved to a cache entry
-    that carries a device-provided name is a candidate. A VID absent from
-    the cache, or present only as a nameless stub, is deliberately treated
-    the same as "not an SVI at all" — the caller must never call
-    ``_ensure_vlan``, which would synthesize (and thereby rename) a stub.
+    The VLAN ID comes from the device first: ``iface_vlan_ids`` is the
+    driver's own interface-to-VLAN-ID map (``get_interfaces_vlan_id``), so a
+    routed VLAN interface such as ``sfpplus1.156`` is resolved from the
+    ``vlan-id`` the device configured, never from its name. Only an interface
+    the driver reports nothing for falls back to an SVI-style name (per
+    ``svi_vlan_id``). Where both exist and disagree, the device wins: a free-
+    text name like ``vlan20`` can carry VLAN ID 30. An interface the driver
+    maps to ``None`` is one whose tag the device reports but that is not a
+    plain 802.1Q VLAN; it proposes nothing and its name is not consulted.
+
+    Either way, the VID must resolve to a cache entry that carries a
+    device-provided name. A VID absent from the cache, or present only as a
+    nameless stub, is deliberately treated the same as "not an SVI at all" —
+    the caller must never call ``_ensure_vlan``, which would synthesize (and
+    thereby rename) a stub.
     """
-    vid = svi_vlan_id(interface_name)
+    iface_vlan_ids = iface_vlan_ids or {}
+    if interface_name in iface_vlan_ids and iface_vlan_ids[interface_name] is None:
+        # The device knows this interface and says its tag is not a usable
+        # 802.1Q VLAN (an S-tag, a tag stacked on another VLAN, a VLAN ID on
+        # two parents); the name must not be allowed to say otherwise.
+        logger.debug("%s: device withholds its VLAN ID; no prefix VLAN", interface_name)
+        return None
+    vid = iface_vlan_ids.get(interface_name)
+    from_device = vid is not None
+    if vid is None:
+        vid = svi_vlan_id(interface_name)
+    elif svi_vlan_id(interface_name) not in (None, vid):
+        logger.debug(
+            "%s: device reports VLAN ID %d, which overrides the %d its name suggests",
+            interface_name,
+            vid,
+            svi_vlan_id(interface_name),
+        )
     if vid is None:
         return None
     vlan = (vlan_cache or {}).get(vid)
     if vlan is None or not vlan.name:
+        if from_device:
+            # Typically a routed subinterface whose tag has no VLAN on the
+            # device: there is no named VLAN to link to, and none is created.
+            logger.debug(
+                "%s: device reports VLAN ID %d, but the device lists no named VLAN %d; no prefix VLAN",
+                interface_name,
+                vid,
+                vid,
+            )
         return None
     return vlan
+
+
+def _address_entities(
+    interface: Interface,
+    ip_address: str,
+    prefix_fields: dict | None,
+    ip_fields: dict | None,
+    emit_host_prefixes: bool,
+) -> list[Entity]:
+    """
+    Build the Prefix and the IPAddress for one discovered address.
+
+    ``None`` fields send nothing of that kind, which is how emit_prefixes and
+    emit_ip_addresses turn them off.
+    """
+    entities: list[Entity] = []
+    # ip_interface keeps the host bits, so .ip is the address the device
+    # reported and .network is the same value ip_network(..., strict=False)
+    # produced. Parsing once means the two can never disagree.
+    interface_address = ipaddress.ip_interface(ip_address)
+    network = interface_address.network
+    if prefix_fields is not None:
+        skip_reason = _undesirable_prefix_reason(
+            network, interface_address.ip, emit_host_prefixes
+        )
+        if skip_reason:
+            logger.debug(
+                "%s: not deriving a prefix from %s (%s)",
+                interface.name,
+                ip_address,
+                skip_reason,
+            )
+        else:
+            entities.append(Entity(prefix=Prefix(prefix=str(network), **prefix_fields)))
+    if ip_fields is not None:
+        entities.append(
+            Entity(
+                ip_address=IPAddress(
+                    address=ip_address,
+                    assigned_object_interface=Interface(
+                        device=interface.device,
+                        name=interface.name,
+                        type=interface.type,
+                    ),
+                    **ip_fields,
+                )
+            )
+        )
+    return entities
 
 
 def translate_interface_ips(
@@ -464,6 +551,7 @@ def translate_interface_ips(
     options: "Options | None" = None,
     iface_vrf_map: dict[str, pb.VRF] | None = None,
     vlan_cache: dict[int, pb.VLAN] | None = None,
+    iface_vlan_ids: dict[str, int | None] | None = None,
 ) -> Iterable[Entity]:
     """
     Translate IP address and Prefixes information for an interface.
@@ -488,6 +576,10 @@ def translate_interface_ips(
             (``_resolve_prefix_vlan_candidate``); this is provisional and
             the same object's contributing addresses are reconciled to
             unanimity once by the caller, ``build_interface_entities``.
+        iface_vlan_ids (dict[str, int | None] | None): Interface name → VLAN
+            ID the device itself reports (``get_interfaces_vlan_id``),
+            preferred over the SVI-name parse when resolving the candidate;
+            ``None`` means the device withholds it.
 
     Returns:
     -------
@@ -545,6 +637,10 @@ def translate_interface_ips(
     scope_kwargs = _resolve_prefix_scope_kwargs(defaults, options)
     # Opt-in: host prefixes are not derived unless the operator asks for them.
     emit_host_prefixes = bool(options and options.emit_host_prefixes)
+    emit_prefixes = options is None or options.emit_prefixes
+    emit_ip_addresses = options is None or options.emit_ip_addresses
+    if not emit_prefixes and not emit_ip_addresses:
+        return []
 
     # Device state beats policy defaults: a VRF discovered for this
     # interface overrides every configured vrf default for its IPs and
@@ -560,7 +656,7 @@ def translate_interface_ips(
     prefix_vlan_candidate = None
     if options and options.emit_prefix_vlan == "svi-name":
         prefix_vlan_candidate = _resolve_prefix_vlan_candidate(
-            interface.name, vlan_cache
+            interface.name, vlan_cache, iface_vlan_ids
         )
 
     ip_entities = []
@@ -576,56 +672,40 @@ def translate_interface_ips(
                 af_prefix_vrf = discovered_vrf or (
                     prefix_vrf_ipv4 if ip_version == "ipv4" else prefix_vrf_ipv6
                 ) or prefix_vrf
+                prefix_fields = (
+                    {
+                        "vrf": af_prefix_vrf,
+                        "role": prefix_role,
+                        "tenant": prefix_tenant,
+                        "tags": prefix_tags,
+                        "comments": prefix_comments,
+                        "description": prefix_description,
+                        "vlan": prefix_vlan_candidate,
+                        **scope_kwargs,
+                    }
+                    if emit_prefixes
+                    else None
+                )
+                ip_fields = (
+                    {
+                        "role": ip_role,
+                        "tenant": ip_tenant,
+                        "vrf": af_ip_vrf,
+                        "tags": ip_tags,
+                        "comments": ip_comments,
+                        "description": ip_description,
+                    }
+                    if emit_ip_addresses
+                    else None
+                )
                 for ip, details in ip_info.get(ip_version, {}).items():
-                    ip_address = f"{ip}/{details.get('prefix_length', default_prefix)}"
-                    # ip_interface keeps the host bits, so .ip is the address
-                    # the device reported and .network is the same value
-                    # ip_network(..., strict=False) produced. Parsing once
-                    # means the two can never disagree.
-                    interface_address = ipaddress.ip_interface(ip_address)
-                    network = interface_address.network
-                    skip_reason = _undesirable_prefix_reason(
-                        network, interface_address.ip, emit_host_prefixes
-                    )
-                    if skip_reason:
-                        logger.debug(
-                            "%s: not deriving a prefix from %s (%s)",
-                            interface.name,
-                            ip_address,
-                            skip_reason,
-                        )
-                    else:
-                        ip_entities.append(
-                            Entity(
-                                prefix=Prefix(
-                                    prefix=str(network),
-                                    vrf=af_prefix_vrf,
-                                    role=prefix_role,
-                                    tenant=prefix_tenant,
-                                    tags=prefix_tags,
-                                    comments=prefix_comments,
-                                    description=prefix_description,
-                                    vlan=prefix_vlan_candidate,
-                                    **scope_kwargs,
-                                )
-                            )
-                        )
-                    ip_entities.append(
-                        Entity(
-                            ip_address=IPAddress(
-                                address=ip_address,
-                                assigned_object_interface=Interface(
-                                    device=interface.device,
-                                    name=interface.name,
-                                    type=interface.type,
-                                ),
-                                role=ip_role,
-                                tenant=ip_tenant,
-                                vrf=af_ip_vrf,
-                                tags=ip_tags,
-                                comments=ip_comments,
-                                description=ip_description,
-                            )
+                    ip_entities.extend(
+                        _address_entities(
+                            interface,
+                            f"{ip}/{details.get('prefix_length', default_prefix)}",
+                            prefix_fields,
+                            ip_fields,
+                            emit_host_prefixes,
                         )
                     )
 
@@ -727,6 +807,7 @@ def build_interface_entities(
     options: "Options | None" = None,
     iface_vrf_map: dict[str, pb.VRF] | None = None,
     vlan_cache: dict[int, pb.VLAN] | None = None,
+    iface_vlan_ids: dict[str, int | None] | None = None,
 ) -> list[Entity]:
     """
     Create interface entities from interface definitions and IP data.
@@ -742,9 +823,10 @@ def build_interface_entities(
     interface carry that discovered VRF instead of the configured defaults.
 
     When ``options.emit_prefix_vlan == "svi-name"``, each derived Prefix
-    carries the VLAN of the SVI-style interface its address lives on
-    (resolved against ``vlan_cache``) — but only once every interface
-    contributing to that same (prefix, vrf) agrees; see
+    carries the VLAN of the interface its address lives on — the VLAN ID the
+    device reports for it in ``iface_vlan_ids``, else the one an SVI-style
+    name states — resolved against ``vlan_cache``, but only once every
+    interface contributing to that same (prefix, vrf) agrees; see
     ``_reconcile_prefix_vlans``.
     """
     exclude_patterns = _compile_exclude_patterns(defaults.interface_exclude_patterns or [])
@@ -789,6 +871,7 @@ def build_interface_entities(
                 options=options,
                 iface_vrf_map=iface_vrf_map,
                 vlan_cache=vlan_cache,
+                iface_vlan_ids=iface_vlan_ids,
             )
         )
 
@@ -810,6 +893,7 @@ def build_interface_entities(
                 options=options,
                 iface_vrf_map=iface_vrf_map,
                 vlan_cache=vlan_cache,
+                iface_vlan_ids=iface_vlan_ids,
             )
         )
 

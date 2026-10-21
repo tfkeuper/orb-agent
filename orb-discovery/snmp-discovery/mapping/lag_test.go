@@ -9,7 +9,7 @@ import (
 	"github.com/netboxlabs/diode-sdk-go/diode"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/netboxlabs/orb-agent/orb-discovery/snmp-discovery/config"
 )
@@ -144,12 +144,12 @@ func TestAttachLagMembership_ChannelizedLanesKeepTheirOwnMembership(t *testing.T
 	assert.Nil(t, port.Lag, "the un-channelized port is not a member of anything")
 }
 
-// The interface that would carry the reference has to be one NetBox
-// accepts it on. With no ifType in the walk the member is used as-is and
-// its type comes from the policy default, which an operator can set to a
-// virtual one — and NetBox rejects the whole interface, not just the
-// relationship, when a LAG parent lands on a virtual type.
-func TestAttachLagMembership_RefusesTargetNetBoxWouldReject(t *testing.T) {
+// The interface that would carry the reference has to be able to. With no
+// ifType in the walk the member is used as-is and its type comes from the
+// policy default, which an operator can set to a virtual one, and NetBox
+// rejects the whole interface, not just the relationship, when a LAG parent
+// lands on a virtual type. bridge and lag are not LAG members in practice.
+func TestAttachLagMembership_SkipsTargetThatCannotCarryALag(t *testing.T) {
 	dev := &diode.Device{Name: strPtr("sw")}
 	ae1 := lagIface("ae1", "lag", dev)
 	byIface := map[*diode.Interface]int{ae1: 9}
@@ -274,7 +274,7 @@ func lagMembershipRowsDoNotDisplaceInterfaceRows(t *testing.T) {
 	assert.True(t, names["xe-0/0/2"])
 	assert.True(t, names["ae23"])
 
-	ents = TranslateAsStack(ents, oids, byIfIndex, nil, "", logger)
+	ents = TranslateAsStack(ents, oids, byIfIndex, nil, "", ModelNotPinned, logger)
 	require.Equal(t, 1, AttachLagMembership(oids, byIfIndex, logger))
 	for iface, idx := range byIfIndex {
 		switch idx {
